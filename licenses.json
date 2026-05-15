@@ -1,0 +1,25 @@
+{
+  "VER-DEMO-001": {
+    "type": "demo",
+    "active": true,
+    "max_devices": 1,
+    "demo_days": 7,
+    "expiry": null,
+    "sold_to": "Demo User",
+    "sold_by": "Direct",
+    "sold_date": "2025-05-15",
+    "expected_country": "Turkey",
+    "devices": []
+  },
+  "VER-TEST-001": {
+    "type": "paid",
+    "active": true,
+    "max_devices": 5,
+    "expiry": "2026-12-31",
+    "sold_to": "Test Company",
+    "sold_by": "You",
+    "sold_date": "2025-05-15",
+    "expected_country": "Turkey",
+    "devices": []
+  }
+}
