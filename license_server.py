@@ -44,6 +44,10 @@ def init_db():
                 );
             """)
             cur.execute("""
+                ALTER TABLE licenses
+                ADD COLUMN IF NOT EXISTS notes TEXT;
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS devices (
                     id BIGSERIAL PRIMARY KEY,
                     license_key TEXT NOT NULL REFERENCES licenses(license_key) ON DELETE CASCADE,
@@ -95,14 +99,14 @@ def import_json_if_empty():
                 cur.execute("""
                     INSERT INTO licenses (
                         license_key, type, active, max_devices, demo_days,
-                        expiry, sold_to, sold_by, sold_date, expected_country
+                        expiry, sold_to, sold_by, sold_date, expected_country, notes
                     ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (license_key) DO NOTHING
                 """, (
                     key, data.get("type", "paid"), bool(data.get("active", True)),
                     int(data.get("max_devices", 1)), data.get("demo_days"), expiry,
                     data.get("sold_to"), data.get("sold_by"), sold_date,
-                    data.get("expected_country")
+                    data.get("expected_country"), data.get("notes")
                 ))
                 for d in data.get("devices", []):
                     device_pc = d.get("pc_id") or d.get("pc")
@@ -318,6 +322,7 @@ def license_row_to_dict(row):
         "sold_by": row["sold_by"],
         "sold_date": row["sold_date"].strftime(DATE_FMT) if row["sold_date"] else None,
         "expected_country": row["expected_country"],
+        "notes": row.get("notes"),
     }
 
 
@@ -428,7 +433,8 @@ def admin_dashboard():
                     "sold_date": row["sold_date"].strftime(DATE_FMT) if row["sold_date"] else None,
                     "active": row["active"], "type": row["type"],
                     "expiry": row["expiry"].strftime(DATE_FMT) if row["expiry"] else None,
-                    "demo_days": row["demo_days"], "devices_used": len(devices), "max_devices": row["max_devices"],
+                    "demo_days": row["demo_days"], "notes": row.get("notes"),
+                    "devices_used": len(devices), "max_devices": row["max_devices"],
                     "countries": countries, "companies_entered": companies, "issues": issues, "devices": device_list
                 })
             cur.execute("SELECT * FROM activation_logs ORDER BY timestamp DESC LIMIT 100")
@@ -454,16 +460,17 @@ def admin_license_upsert():
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO licenses (license_key, type, active, max_devices, demo_days, expiry, sold_to, sold_by, sold_date, expected_country)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO licenses (license_key, type, active, max_devices, demo_days, expiry, sold_to, sold_by, sold_date, expected_country, notes)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (license_key) DO UPDATE SET
                     type=EXCLUDED.type, active=EXCLUDED.active, max_devices=EXCLUDED.max_devices,
                     demo_days=EXCLUDED.demo_days, expiry=EXCLUDED.expiry, sold_to=EXCLUDED.sold_to,
                     sold_by=EXCLUDED.sold_by, sold_date=EXCLUDED.sold_date,
-                    expected_country=EXCLUDED.expected_country, updated_at=NOW()
+                    expected_country=EXCLUDED.expected_country, notes=EXCLUDED.notes, updated_at=NOW()
             """, (
                 key, data.get("type", "paid"), bool(data.get("active", True)), int(data.get("max_devices", 1)),
-                data.get("demo_days"), expiry, data.get("sold_to"), data.get("sold_by"), sold_date, data.get("expected_country")
+                data.get("demo_days"), expiry, data.get("sold_to"), data.get("sold_by"), sold_date,
+                data.get("expected_country"), data.get("notes")
             ))
             conn.commit()
     return jsonify({"ok": True, "message": "License saved", "key": key})
@@ -581,6 +588,10 @@ def admin_page():
       <div><label>Sold Date</label><input id="sold_date" placeholder="2026-05-15"></div>
       <div><label>Expected Country</label><input id="expected_country" placeholder="Türkiye"></div>
     </div>
+    
+    <label>Notes</label>
+    <textarea id="notes" rows="4" placeholder="Price, special edits, customer requests, payment notes..." style="width:100%; padding:9px; box-sizing:border-box; margin-top:4px; border:1px solid #bbb; border-radius:8px;"></textarea>
+    
     <button onclick="saveLicense()">Save License</button>
     <button class="gray" onclick="clearForm()">Clear Form</button>
   </div>
@@ -622,7 +633,8 @@ function getFormData() {
     sold_to: document.getElementById('sold_to').value.trim() || null,
     sold_by: document.getElementById('sold_by').value.trim() || null,
     sold_date: document.getElementById('sold_date').value.trim() || null,
-    expected_country: document.getElementById('expected_country').value.trim() || null
+    expected_country: document.getElementById('expected_country').value.trim() || null,
+    notes: document.getElementById('notes').value.trim() || null
   };
 }
 
@@ -635,7 +647,7 @@ async function saveLicense() {
 }
 
 function clearForm() {
-  for (const id of ['key','demo_days','expiry','sold_to','sold_by','sold_date','expected_country']) document.getElementById(id).value = '';
+  for (const id of ['key','demo_days','expiry','sold_to','sold_by','sold_date','expected_country','notes']) document.getElementById(id).value = '';
   document.getElementById('type').value = 'paid';
   document.getElementById('active').value = 'true';
   document.getElementById('max_devices').value = '1';
@@ -652,6 +664,7 @@ function editLicense(l) {
   document.getElementById('sold_by').value = l.sold_by || '';
   document.getElementById('sold_date').value = l.sold_date || '';
   document.getElementById('expected_country').value = (l.expected_country || '');
+  document.getElementById('notes').value = (l.notes || '');
   window.scrollTo({top:0, behavior:'smooth'});
 }
 
@@ -691,8 +704,7 @@ function renderDashboard(data) {
     html += `<tr>
       <td><b>${escapeHtml(l.key)}</b><br><span class="small">${escapeHtml(l.type)}</span></td>
       <td class="${l.active ? 'active' : 'inactive'}">${l.active ? 'ACTIVE' : 'INACTIVE'}</td>
-      <td>${escapeHtml(l.sold_to)}<br><span class="small">Sold by: ${escapeHtml(l.sold_by)}<br>Country: ${escapeHtml(l.expected_country || '')}</span></td>
-      <td>${l.devices_used}/${l.max_devices}<br>${devices}</td>
+      <td>${escapeHtml(l.sold_to)}<br><span class="small">Sold by: ${escapeHtml(l.sold_by)}<br>Country: ${escapeHtml(l.expected_country || '')}<br><b>Notes:</b><br>${escapeHtml(l.notes || '')}</span></td>      <td>${l.devices_used}/${l.max_devices}<br>${devices}</td>
       <td>${escapeHtml(l.expiry || '')}<br><span class="small">demo days: ${escapeHtml(l.demo_days || '')}</span></td>
       <td>${issues}</td>
       <td>
