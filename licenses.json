@@ -3,7 +3,7 @@
     "type": "demo",
     "active": true,
     "max_devices": 1,
-    "demo_days": 7,
+    "demo_days": 8,
     "expiry": null,
     "sold_to": "Demo User",
     "sold_by": "Direct",
