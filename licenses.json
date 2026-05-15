@@ -13,7 +13,7 @@
   },
   "VER-TEST-0001": {
     "type": "paid",
-    "active": true,
+    "active": false,
     "max_devices": 5,
     "expiry": "2026-12-31",
     "sold_to": "Test Company",
