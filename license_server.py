@@ -153,21 +153,119 @@ def verify_admin():
     admin_token = request.headers.get("X-Admin-Token", "")
     return bool(ADMIN_PASSWORD) and hmac.compare_digest(admin_token, ADMIN_PASSWORD)
 
+def is_private_ip(ip):
+    try:
+        import ipaddress
+        ip_obj = ipaddress.ip_address(ip)
+        return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved
+    except Exception:
+        return False
+
+
 
 def get_client_ip():
-    ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
-    if ip_address and "," in ip_address:
-        ip_address = ip_address.split(",")[0].strip()
-    return ip_address or "Unknown"
+    """
+    Get the best public client IP from Render/proxy headers.
+    """
+    possible_headers = [
+        "CF-Connecting-IP",
+        "X-Real-IP",
+        "X-Forwarded-For",
+        "Forwarded",
+    ]
+
+    for header in possible_headers:
+        value = request.headers.get(header)
+        if not value:
+            continue
+
+        # X-Forwarded-For can be: client, proxy1, proxy2
+        if header == "X-Forwarded-For":
+            parts = [p.strip() for p in value.split(",") if p.strip()]
+            for ip in parts:
+                if ip and not is_private_ip(ip):
+                    return ip
+
+        # Forwarded can be: for=1.2.3.4;proto=https
+        if header == "Forwarded":
+            parts = value.split(";")
+            for part in parts:
+                part = part.strip()
+                if part.lower().startswith("for="):
+                    ip = part.split("=", 1)[1].strip().strip('"')
+                    if ip and not is_private_ip(ip):
+                        return ip
+
+        ip = value.strip()
+        if ip and not is_private_ip(ip):
+            return ip
+
+    ip = request.remote_addr or "Unknown"
+    return ip
 
 
 def get_location_from_ip(ip_address):
+    """
+    Get country and city from IP address.
+    Tries ipapi.co first, then ipwho.is as fallback.
+    """
+
+    if not ip_address or ip_address == "Unknown" or is_private_ip(ip_address):
+        return {
+            "country": "Unknown",
+            "city": "Unknown",
+            "ip": ip_address or "Unknown"
+        }
+
+    # Provider 1: ipapi.co
     try:
-        response = requests.get(f"https://ipapi.co/{ip_address}/json/", timeout=5)
+        response = requests.get(
+            f"https://ipapi.co/{ip_address}/json/",
+            timeout=8,
+            headers={"User-Agent": "PergoCAD-License-Server/1.0"}
+        )
+
         data = response.json()
-        return {"country": data.get("country_name", "Unknown"), "city": data.get("city", "Unknown"), "ip": ip_address}
-    except Exception:
-        return {"country": "Unknown", "city": "Unknown", "ip": ip_address}
+
+        if not data.get("error"):
+            country = data.get("country_name") or data.get("country")
+            city = data.get("city")
+
+            if country or city:
+                return {
+                    "country": country or "Unknown",
+                    "city": city or "Unknown",
+                    "ip": ip_address
+                }
+
+    except Exception as e:
+        print(f"ipapi geolocation error for {ip_address}: {e}")
+
+    # Provider 2: ipwho.is fallback
+    try:
+        response = requests.get(
+            f"https://ipwho.is/{ip_address}",
+            timeout=8,
+            headers={"User-Agent": "PergoCAD-License-Server/1.0"}
+        )
+
+        data = response.json()
+
+        if data.get("success", False):
+            return {
+                "country": data.get("country") or "Unknown",
+                "city": data.get("city") or "Unknown",
+                "ip": ip_address
+            }
+
+    except Exception as e:
+        print(f"ipwho.is geolocation error for {ip_address}: {e}")
+
+    return {
+        "country": "Unknown",
+        "city": "Unknown",
+        "ip": ip_address
+    }
 
 
 def log_activation(key, company, pc_id, location, success, message=""):
