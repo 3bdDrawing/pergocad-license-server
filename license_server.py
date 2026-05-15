@@ -1,418 +1,434 @@
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
+import hashlib
+import hmac
 import json
 import os
-import requests
-
-import hmac
-import hashlib
 import time
+import requests
+import psycopg
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-# Your secret key (same as in customer app)
-PERGOCAD_API_SECRET = "PergoCAD-Secret-2026"
-
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+PERGOCAD_API_SECRET = os.environ.get("PERGOCAD_API_SECRET", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 LICENSE_FILE = "licenses.json"
-LOG_FILE = "activation_log.json"
+DATE_FMT = "%Y-%m-%d"
 
-# ============================================================
-# GEOLOCATION - Detect Country from IP
-# ============================================================
 
-def get_location_from_ip(ip_address):
-    """Get country and city from IP address."""
-    try:
-        # Using ipapi.co - free, no API key needed, 1000 requests/day
-        response = requests.get(
-            f"https://ipapi.co/{ip_address}/json/",
-            timeout=5
-        )
-        data = response.json()
-        
-        return {
-            "country": data.get("country_name", "Unknown"),
-            "city": data.get("city", "Unknown"),
-            "ip": ip_address
-        }
-    except Exception as e:
-        print(f"Geolocation error: {e}")
-        return {
-            "country": "Unknown",
-            "city": "Unknown",
-            "ip": ip_address
-        }
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-# ============================================================
-# LOAD/SAVE LICENSE DATA
-# ============================================================
 
-def load_licenses():
-    """Load all licenses from JSON file."""
-    try:
-        with open(LICENSE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def init_db():
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS licenses (
+                    license_key TEXT PRIMARY KEY,
+                    type TEXT NOT NULL DEFAULT 'paid',
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    max_devices INTEGER NOT NULL DEFAULT 1,
+                    demo_days INTEGER,
+                    expiry DATE,
+                    sold_to TEXT,
+                    sold_by TEXT,
+                    sold_date DATE,
+                    expected_country TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS devices (
+                    id BIGSERIAL PRIMARY KEY,
+                    license_key TEXT NOT NULL REFERENCES licenses(license_key) ON DELETE CASCADE,
+                    pc_id TEXT NOT NULL,
+                    company_name TEXT,
+                    activated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    ip_address TEXT,
+                    country TEXT,
+                    city TEXT,
+                    check_count INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE (license_key, pc_id)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS activation_logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    license_key TEXT,
+                    company TEXT,
+                    pc_id_short TEXT,
+                    ip TEXT,
+                    country TEXT,
+                    city TEXT,
+                    success BOOLEAN NOT NULL DEFAULT FALSE,
+                    message TEXT
+                );
+            """)
+            conn.commit()
 
-def save_licenses(licenses):
-    """Save licenses to JSON file."""
-    with open(LICENSE_FILE, "w", encoding="utf-8") as f:
-        json.dump(licenses, f, indent=2, ensure_ascii=False)
 
-# ============================================================
-# LOGGING - Track Every Activation
-# ============================================================
+def import_json_if_empty():
+    if not os.path.exists(LICENSE_FILE):
+        return
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM licenses")
+            if cur.fetchone()["c"] > 0:
+                return
+            with open(LICENSE_FILE, "r", encoding="utf-8") as f:
+                licenses = json.load(f)
+            for key, data in licenses.items():
+                expiry = data.get("expiry")
+                if expiry == "null" or expiry == "":
+                    expiry = None
+                sold_date = data.get("sold_date")
+                if sold_date == "null" or sold_date == "":
+                    sold_date = None
+                cur.execute("""
+                    INSERT INTO licenses (
+                        license_key, type, active, max_devices, demo_days,
+                        expiry, sold_to, sold_by, sold_date, expected_country
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (license_key) DO NOTHING
+                """, (
+                    key, data.get("type", "paid"), bool(data.get("active", True)),
+                    int(data.get("max_devices", 1)), data.get("demo_days"), expiry,
+                    data.get("sold_to"), data.get("sold_by"), sold_date,
+                    data.get("expected_country")
+                ))
+                for d in data.get("devices", []):
+                    device_pc = d.get("pc_id") or d.get("pc")
+                    if not device_pc:
+                        continue
+                    cur.execute("""
+                        INSERT INTO devices (
+                            license_key, pc_id, company_name, activated_at,
+                            last_seen, ip_address, country, city, check_count
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (license_key, pc_id) DO NOTHING
+                    """, (
+                        key, device_pc, d.get("company_name") or d.get("company"),
+                        d.get("activated_at") or datetime.utcnow(),
+                        d.get("last_seen") or d.get("last_check") or datetime.utcnow(),
+                        d.get("ip_address"), d.get("country"), d.get("city"),
+                        int(d.get("check_count", 1))
+                    ))
+            conn.commit()
 
-def log_activation(key, company, pc_id, location, success, message=""):
-    """Log every activation attempt for audit trail."""
-    try:
-        # Load existing logs
-        try:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                logs = json.load(f)
-        except:
-            logs = []
-        
-        # Add new log entry
-        log_entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "key": key,
-            "company": company,
-            "pc_id": pc_id[:8] + "...",  # Only partial ID for privacy
-            "ip": location["ip"],
-            "country": location["country"],
-            "city": location["city"],
-            "success": success,
-            "message": message
-        }
-        
-        logs.append(log_entry)
-        
-        # Keep only last 10,000 logs
-        if len(logs) > 10000:
-            logs = logs[-10000:]
-        
-        # Save
-        with open(LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(logs, f, indent=2, ensure_ascii=False)
-            
-    except Exception as e:
-        print(f"Logging error: {e}")
 
-# ============================================================
-# FRAUD DETECTION
-# ============================================================
-
-def detect_fraud(key, license_data, company_name, location):
-    """Detect suspicious activity."""
-    alerts = []
-    
-    # Check 1: Company name mismatch
-    sold_to = license_data.get("sold_to", "").lower().strip()
-    entered_company = company_name.lower().strip()
-    
-    if sold_to and entered_company and sold_to != entered_company:
-        alerts.append(
-            f"⚠️ FRAUD WARNING: License sold to '{license_data['sold_to']}' "
-            f"but activated with company name '{company_name}'"
-        )
-    
-    # Check 2: Wrong country
-    expected_country = license_data.get("expected_country", "").lower()
-    actual_country = location.get("country", "").lower()
-    
-    if expected_country and actual_country != "unknown":
-        if expected_country not in actual_country and actual_country not in expected_country:
-            alerts.append(
-                f"⚠️ LOCATION WARNING: Expected {license_data['expected_country']}, "
-                f"but activated from {location['country']}"
-            )
-    
-    # Check 3: Multiple countries on same license
-    devices = license_data.get("devices", [])
-    countries = set([d.get("country", "Unknown") for d in devices])
-    countries.add(location["country"])
-    
-    if len(countries) > 1 and "Unknown" in countries:
-        countries.remove("Unknown")
-    
-    if len(countries) > 1:
-        alerts.append(
-            f"🚨 MULTIPLE COUNTRIES: License used in {', '.join(countries)}"
-        )
-    
-    return alerts
 def verify_hmac_request():
     secret = request.headers.get("X-PergoCAD-Secret", "")
     timestamp = request.headers.get("X-Timestamp", "")
     signature = request.headers.get("X-Signature", "")
-
+    if not PERGOCAD_API_SECRET:
+        return False, "Server secret is not configured"
     if secret != PERGOCAD_API_SECRET:
         return False, "Unauthorized"
-
     if not timestamp or not signature:
         return False, "Missing request signature"
-
     try:
         timestamp_int = int(timestamp)
     except Exception:
         return False, "Invalid timestamp"
-
-    now = int(time.time())
-
-    # Reject old/replayed requests older than 5 minutes
-    if abs(now - timestamp_int) > 300:
+    if abs(int(time.time()) - timestamp_int) > 300:
         return False, "Request expired"
-
     data = request.get_json(silent=True) or {}
     body_str = json.dumps(data, separators=(",", ":"))
     msg = f"{timestamp}:{body_str}".encode("utf-8")
-
-    expected = hmac.new(
-        PERGOCAD_API_SECRET.encode("utf-8"),
-        msg,
-        hashlib.sha256
-    ).hexdigest()
-
+    expected = hmac.new(PERGOCAD_API_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature):
         return False, "Invalid request signature"
-
     return True, "OK"
-    
-# ============================================================
-# ACTIVATION ENDPOINT
-# ============================================================
 
-@app.route('/activate', methods=['POST'])
+
+def verify_admin():
+    admin_token = request.headers.get("X-Admin-Token", "")
+    return bool(ADMIN_PASSWORD) and hmac.compare_digest(admin_token, ADMIN_PASSWORD)
+
+
+def get_client_ip():
+    ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
+    if ip_address and "," in ip_address:
+        ip_address = ip_address.split(",")[0].strip()
+    return ip_address or "Unknown"
+
+
+def get_location_from_ip(ip_address):
+    try:
+        response = requests.get(f"https://ipapi.co/{ip_address}/json/", timeout=5)
+        data = response.json()
+        return {"country": data.get("country_name", "Unknown"), "city": data.get("city", "Unknown"), "ip": ip_address}
+    except Exception:
+        return {"country": "Unknown", "city": "Unknown", "ip": ip_address}
+
+
+def log_activation(key, company, pc_id, location, success, message=""):
+    pc_short = (pc_id[:8] + "...") if pc_id else ""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO activation_logs (
+                    license_key, company, pc_id_short, ip, country, city, success, message
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (key, company, pc_short, location.get("ip"), location.get("country"), location.get("city"), bool(success), message))
+            conn.commit()
+
+
+def normalize_country(value):
+    if not value:
+        return ""
+    v = value.strip().lower()
+    aliases = {"turkey": "turkiye", "türkiye": "turkiye", "turkiye": "turkiye"}
+    return aliases.get(v, v)
+
+
+def detect_fraud(license_data, company_name, location, existing_countries):
+    alerts = []
+    sold_to = (license_data.get("sold_to") or "").lower().strip()
+    entered_company = (company_name or "").lower().strip()
+    if sold_to and entered_company and sold_to != entered_company:
+        alerts.append(f"⚠️ FRAUD WARNING: License sold to '{license_data.get('sold_to')}' but activated with company name '{company_name}'")
+    expected_country = normalize_country(license_data.get("expected_country"))
+    actual_country = normalize_country(location.get("country"))
+    if expected_country and actual_country and actual_country != "unknown" and expected_country != actual_country:
+        alerts.append(f"⚠️ LOCATION WARNING: Expected {license_data.get('expected_country')}, but activated from {location.get('country')}")
+    countries = set([c for c in existing_countries if c and c != "Unknown"])
+    countries.add(location.get("country", "Unknown"))
+    countries.discard("Unknown")
+    if len(countries) > 1:
+        alerts.append(f"🚨 MULTIPLE COUNTRIES: License used in {', '.join(sorted(countries))}")
+    return alerts
+
+
+def license_row_to_dict(row):
+    return {
+        "key": row["license_key"],
+        "type": row["type"],
+        "active": row["active"],
+        "max_devices": row["max_devices"],
+        "demo_days": row["demo_days"],
+        "expiry": row["expiry"].strftime(DATE_FMT) if row["expiry"] else None,
+        "sold_to": row["sold_to"],
+        "sold_by": row["sold_by"],
+        "sold_date": row["sold_date"].strftime(DATE_FMT) if row["sold_date"] else None,
+        "expected_country": row["expected_country"],
+    }
+
+
+@app.route("/activate", methods=["POST"])
 def activate():
     ok_sig, sig_message = verify_hmac_request()
     if not ok_sig:
         return jsonify({"ok": False, "message": sig_message}), 401
-
     data = request.get_json(silent=True) or {}
-    
-    key = data.get('key', '').strip()
-    company = data.get('company', '').strip()
-    pc_id = data.get('pc_id', '').strip()
-    
-    # Get IP address
-    ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if ',' in ip_address:
-        ip_address = ip_address.split(',')[0].strip()
-    
-    # Get location from IP
+    key = data.get("key", "").strip()
+    company = data.get("company", "").strip()
+    pc_id = data.get("pc_id", "").strip()
+    ip_address = get_client_ip()
     location = get_location_from_ip(ip_address)
-    
-    # Load licenses
-    licenses = load_licenses()
-    
-    # Check if license exists
-    if key not in licenses:
-        log_activation(key, company, pc_id, location, False, "Invalid license key")
-        return jsonify({"ok": False, "message": "Invalid license key"})
-    
-    license_data = licenses[key]
-    
-    # Check if license is active
-    if not license_data.get("active", False):
-        log_activation(key, company, pc_id, location, False, "License deactivated")
-        return jsonify({"ok": False, "message": "This license has been deactivated"})
-    
-    # Check expiry for paid licenses
-    if license_data.get("type") == "paid":
-        expiry_str = license_data.get("expiry")
-        if expiry_str:
-            try:
-                expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d")
-                if datetime.utcnow() > expiry_date:
-                    log_activation(key, company, pc_id, location, False, "License expired")
-                    return jsonify({"ok": False, "message": "License expired"})
-            except:
-                pass
-    
-    # Handle demo licenses
-    if license_data.get("type") == "demo":
-        demo_days = license_data.get("demo_days", 1)
-        
-        # Check if already activated (demo expiry was set)
-        if not license_data.get("expiry"):
-            # First activation - set expiry
-            from datetime import timedelta
-            expiry_date = datetime.utcnow() + timedelta(days=demo_days)
-            license_data["expiry"] = expiry_date.strftime("%Y-%m-%d")
-            licenses[key] = license_data
-            save_licenses(licenses)
-        
-        # Check if demo expired
-        expiry_str = license_data.get("expiry")
-        if expiry_str:
-            try:
-                expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d")
-                if datetime.utcnow() > expiry_date:
+    if not key or not pc_id:
+        log_activation(key, company, pc_id, location, False, "Missing key or pc_id")
+        return jsonify({"ok": False, "message": "Missing license key or computer ID"})
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM licenses WHERE license_key=%s", (key,))
+            lic_row = cur.fetchone()
+            if not lic_row:
+                log_activation(key, company, pc_id, location, False, "Invalid license key")
+                return jsonify({"ok": False, "message": "Invalid license key"})
+            license_data = license_row_to_dict(lic_row)
+            if not lic_row["active"]:
+                log_activation(key, company, pc_id, location, False, "License deactivated")
+                return jsonify({"ok": False, "message": "This license has been deactivated"})
+            if lic_row["type"] == "paid" and lic_row["expiry"] and datetime.utcnow().date() > lic_row["expiry"]:
+                log_activation(key, company, pc_id, location, False, "License expired")
+                return jsonify({"ok": False, "message": "License expired"})
+            if lic_row["type"] == "demo":
+                if not lic_row["expiry"]:
+                    expiry_date = datetime.utcnow().date() + timedelta(days=int(lic_row["demo_days"] or 1))
+                    cur.execute("UPDATE licenses SET expiry=%s, updated_at=NOW() WHERE license_key=%s", (expiry_date, key))
+                    lic_row["expiry"] = expiry_date
+                    license_data["expiry"] = expiry_date.strftime(DATE_FMT)
+                if lic_row["expiry"] and datetime.utcnow().date() > lic_row["expiry"]:
                     log_activation(key, company, pc_id, location, False, "Demo expired")
                     return jsonify({"ok": False, "message": "Demo license expired"})
-            except:
-                pass
-    
-    # Get devices list
-    devices = license_data.get("devices", [])
-    
-    # Check if this PC already activated
-    device_entry = None
-    for d in devices:
-        if d["pc_id"] == pc_id:
-            device_entry = d
-            break
-    
-    if device_entry:
-        # UPDATE existing device
-        device_entry["last_seen"] = datetime.utcnow().isoformat() + "Z"
-        device_entry["check_count"] = device_entry.get("check_count", 0) + 1
-        device_entry["ip_address"] = ip_address
-        device_entry["country"] = location["country"]
-        device_entry["city"] = location["city"]
-        
-        message = "License verified"
-    else:
-        # NEW device activation
-        max_devices = license_data.get("max_devices", 1)
-        
-        if len(devices) >= max_devices:
-            log_activation(key, company, pc_id, location, False, 
-                         f"Max devices ({max_devices}) already activated")
-            return jsonify({
-                "ok": False, 
-                "message": f"Maximum devices ({max_devices}) already activated for this license"
-            })
-        
-        # Add new device
-        new_device = {
-            "pc_id": pc_id,
-            "company_name": company,
-            "activated_at": datetime.utcnow().isoformat() + "Z",
-            "last_seen": datetime.utcnow().isoformat() + "Z",
-            "ip_address": ip_address,
-            "country": location["country"],
-            "city": location["city"],
-            "check_count": 1
-        }
-        
-        devices.append(new_device)
-        message = "New device activated successfully"
-    
-    # Detect fraud
-    fraud_alerts = detect_fraud(key, license_data, company, location)
-    if fraud_alerts:
-        # Log fraud but still allow activation (so you can track it)
-        for alert in fraud_alerts:
-            log_activation(key, company, pc_id, location, True, alert)
-    
-    # Save updated license
-    license_data["devices"] = devices
-    licenses[key] = license_data
-    save_licenses(licenses)
-    
-    # Log successful activation
+            cur.execute("SELECT * FROM devices WHERE license_key=%s AND pc_id=%s", (key, pc_id))
+            device = cur.fetchone()
+            if device:
+                cur.execute("""
+                    UPDATE devices SET last_seen=NOW(), check_count=check_count + 1,
+                        ip_address=%s, country=%s, city=%s, company_name=%s
+                    WHERE license_key=%s AND pc_id=%s
+                """, (ip_address, location["country"], location["city"], company, key, pc_id))
+                message = "License verified"
+            else:
+                cur.execute("SELECT COUNT(*) AS c FROM devices WHERE license_key=%s", (key,))
+                device_count = cur.fetchone()["c"]
+                max_devices = int(lic_row["max_devices"] or 1)
+                if device_count >= max_devices:
+                    log_activation(key, company, pc_id, location, False, f"Max devices ({max_devices}) already activated")
+                    return jsonify({"ok": False, "message": f"Maximum devices ({max_devices}) already activated for this license"})
+                cur.execute("""
+                    INSERT INTO devices (license_key, pc_id, company_name, ip_address, country, city)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                """, (key, pc_id, company, ip_address, location["country"], location["city"]))
+                message = "New device activated successfully"
+            cur.execute("SELECT DISTINCT country FROM devices WHERE license_key=%s", (key,))
+            existing_countries = [r["country"] for r in cur.fetchall()]
+            fraud_alerts = detect_fraud(license_data, company, location, existing_countries)
+            conn.commit()
+    for alert in fraud_alerts:
+        log_activation(key, company, pc_id, location, True, alert)
     log_activation(key, company, pc_id, location, True, message)
-    
-    # Return success
-    return jsonify({
-        "ok": True,
-        "type": license_data.get("type", "paid"),
-        "expiry": license_data.get("expiry"),
-        "message": message
-    })
+    return jsonify({"ok": True, "type": license_data.get("type", "paid"), "expiry": license_data.get("expiry"), "message": message})
 
-# ============================================================
-# ADMIN DASHBOARD
-# ============================================================
 
-@app.route('/admin/dashboard', methods=['GET'])
+@app.route("/admin/dashboard", methods=["GET"])
 def admin_dashboard():
-    """Admin endpoint to view all license activity."""
-    
-    # Simple password protection
-    admin_token = request.headers.get('X-Admin-Token')
-    ADMIN_PASSWORD = "PergoCAD2025Secret!Admin"  # CHANGE THIS!
-    
-    if admin_token != ADMIN_PASSWORD:
+    if not verify_admin():
         return jsonify({"error": "Unauthorized"}), 401
-    
-    # Load data
-    licenses = load_licenses()
-    
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            logs = json.load(f)
-    except:
-        logs = []
-    
-    # Build summary
-    summary = []
-    
-    for key, data in licenses.items():
-        devices = data.get("devices", [])
-        max_devices = data.get("max_devices", 1)
-        
-        # Get unique countries
-        countries = list(set([d.get("country", "Unknown") for d in devices]))
-        
-        # Get unique company names entered
-        companies = list(set([d.get("company_name", "Unknown") for d in devices]))
-        
-        # Detect issues
-        issues = []
-        
-        # Issue 1: Over-activated
-        if len(devices) > max_devices:
-            issues.append(f"🚨 OVER-ACTIVATED: {len(devices)}/{max_devices} devices")
-        
-        # Issue 2: Multiple countries
-        if len(countries) > 1 and "Unknown" in countries:
-            countries.remove("Unknown")
-        if len(countries) > 1:
-            issues.append(f"⚠️ Multiple countries: {', '.join(countries)}")
-        
-        # Issue 3: Multiple company names
-        if len(companies) > 1 and "Unknown" in companies:
-            companies.remove("Unknown")
-        if len(companies) > 1:
-            issues.append(f"⚠️ Multiple companies: {', '.join(companies)}")
-        
-        # Issue 4: Company name mismatch
-        sold_to = data.get("sold_to", "").lower()
-        if sold_to:
-            for comp in companies:
-                if comp.lower() != sold_to:
-                    issues.append(f"⚠️ Wrong company: expected '{data['sold_to']}', got '{comp}'")
-        
-        summary.append({
-            "key": key,
-            "sold_to": data.get("sold_to", "Unknown"),
-            "sold_by": data.get("sold_by", "Unknown"),
-            "sold_date": data.get("sold_date", "Unknown"),
-            "active": data.get("active", True),
-            "type": data.get("type", "paid"),
-            "expiry": data.get("expiry"),
-            "devices_used": len(devices),
-            "max_devices": max_devices,
-            "countries": countries,
-            "companies_entered": companies,
-            "issues": issues,
-            "devices": devices
-        })
-    
-    return jsonify({
-        "total_licenses": len(licenses),
-        "licenses": summary,
-        "recent_activations": logs[-100:]  # Last 100 activations
-    })
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM licenses ORDER BY created_at DESC, license_key ASC")
+            license_rows = cur.fetchall()
+            summary = []
+            for row in license_rows:
+                key = row["license_key"]
+                cur.execute("SELECT * FROM devices WHERE license_key=%s ORDER BY activated_at ASC", (key,))
+                devices = cur.fetchall()
+                device_list = [{
+                    "pc_id": d["pc_id"], "company_name": d["company_name"],
+                    "activated_at": d["activated_at"].isoformat(), "last_seen": d["last_seen"].isoformat(),
+                    "ip_address": d["ip_address"], "country": d["country"], "city": d["city"], "check_count": d["check_count"]
+                } for d in devices]
+                countries = sorted(list(set([d["country"] or "Unknown" for d in devices])))
+                companies = sorted(list(set([d["company_name"] or "Unknown" for d in devices])))
+                issues = []
+                if len(devices) > row["max_devices"]:
+                    issues.append(f"🚨 OVER-ACTIVATED: {len(devices)}/{row['max_devices']} devices")
+                clean_countries = [c for c in countries if c != "Unknown"]
+                if len(clean_countries) > 1:
+                    issues.append(f"⚠️ Multiple countries: {', '.join(clean_countries)}")
+                clean_companies = [c for c in companies if c != "Unknown"]
+                if len(clean_companies) > 1:
+                    issues.append(f"⚠️ Multiple companies: {', '.join(clean_companies)}")
+                sold_to = (row["sold_to"] or "").lower().strip()
+                if sold_to:
+                    for comp in clean_companies:
+                        if comp.lower().strip() != sold_to:
+                            issues.append(f"⚠️ Wrong company: expected '{row['sold_to']}', got '{comp}'")
+                summary.append({
+                    "key": key, "sold_to": row["sold_to"], "sold_by": row["sold_by"],
+                    "sold_date": row["sold_date"].strftime(DATE_FMT) if row["sold_date"] else None,
+                    "active": row["active"], "type": row["type"],
+                    "expiry": row["expiry"].strftime(DATE_FMT) if row["expiry"] else None,
+                    "demo_days": row["demo_days"], "devices_used": len(devices), "max_devices": row["max_devices"],
+                    "countries": countries, "companies_entered": companies, "issues": issues, "devices": device_list
+                })
+            cur.execute("SELECT * FROM activation_logs ORDER BY timestamp DESC LIMIT 100")
+            logs = cur.fetchall()
+            recent = [{
+                "timestamp": l["timestamp"].isoformat(), "key": l["license_key"], "company": l["company"],
+                "pc_id": l["pc_id_short"], "ip": l["ip"], "country": l["country"], "city": l["city"],
+                "success": l["success"], "message": l["message"]
+            } for l in logs]
+    return jsonify({"total_licenses": len(summary), "licenses": summary, "recent_activations": recent})
 
-# ============================================================
-# START SERVER
-# ============================================================
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+@app.route("/admin/license/upsert", methods=["POST"])
+def admin_license_upsert():
+    if not verify_admin():
+        return jsonify({"ok": False, "message": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "message": "License key is required"}), 400
+    expiry = data.get("expiry") or None
+    sold_date = data.get("sold_date") or None
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO licenses (license_key, type, active, max_devices, demo_days, expiry, sold_to, sold_by, sold_date, expected_country)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (license_key) DO UPDATE SET
+                    type=EXCLUDED.type, active=EXCLUDED.active, max_devices=EXCLUDED.max_devices,
+                    demo_days=EXCLUDED.demo_days, expiry=EXCLUDED.expiry, sold_to=EXCLUDED.sold_to,
+                    sold_by=EXCLUDED.sold_by, sold_date=EXCLUDED.sold_date,
+                    expected_country=EXCLUDED.expected_country, updated_at=NOW()
+            """, (
+                key, data.get("type", "paid"), bool(data.get("active", True)), int(data.get("max_devices", 1)),
+                data.get("demo_days"), expiry, data.get("sold_to"), data.get("sold_by"), sold_date, data.get("expected_country")
+            ))
+            conn.commit()
+    return jsonify({"ok": True, "message": "License saved", "key": key})
+
+
+@app.route("/admin/license/set-active", methods=["POST"])
+def admin_license_set_active():
+    if not verify_admin():
+        return jsonify({"ok": False, "message": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    active = bool(data.get("active", False))
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE licenses SET active=%s, updated_at=NOW() WHERE license_key=%s", (active, key))
+            changed = cur.rowcount
+            conn.commit()
+    if changed == 0:
+        return jsonify({"ok": False, "message": "License not found"}), 404
+    return jsonify({"ok": True, "message": "License active status changed", "key": key, "active": active})
+
+
+@app.route("/admin/license/delete", methods=["POST"])
+def admin_license_delete():
+    if not verify_admin():
+        return jsonify({"ok": False, "message": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM licenses WHERE license_key=%s", (key,))
+            changed = cur.rowcount
+            conn.commit()
+    if changed == 0:
+        return jsonify({"ok": False, "message": "License not found"}), 404
+    return jsonify({"ok": True, "message": "License deleted", "key": key})
+
+
+@app.route("/admin/license/reset-devices", methods=["POST"])
+def admin_license_reset_devices():
+    if not verify_admin():
+        return jsonify({"ok": False, "message": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM devices WHERE license_key=%s", (key,))
+            deleted = cur.rowcount
+            conn.commit()
+    return jsonify({"ok": True, "message": "Devices reset", "key": key, "deleted_devices": deleted})
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "message": "License server running"})
+
+
+try:
+    init_db()
+    import_json_if_empty()
+except Exception as e:
+    print(f"Database startup error: {e}")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
