@@ -11,7 +11,7 @@
     "expected_country": "Turkey",
     "devices": []
   },
-  "VER-TEST-001": {
+  "VER-TEST-0001": {
     "type": "paid",
     "active": true,
     "max_devices": 5,
