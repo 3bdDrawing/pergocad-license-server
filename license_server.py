@@ -4,6 +4,10 @@ import json
 import os
 import requests
 
+import hmac
+import hashlib
+import time
+
 app = Flask(__name__)
 
 # Your secret key (same as in customer app)
@@ -139,20 +143,55 @@ def detect_fraud(key, license_data, company_name, location):
         )
     
     return alerts
+def verify_hmac_request():
+    secret = request.headers.get("X-PergoCAD-Secret", "")
+    timestamp = request.headers.get("X-Timestamp", "")
+    signature = request.headers.get("X-Signature", "")
 
+    if secret != PERGOCAD_API_SECRET:
+        return False, "Unauthorized"
+
+    if not timestamp or not signature:
+        return False, "Missing request signature"
+
+    try:
+        timestamp_int = int(timestamp)
+    except Exception:
+        return False, "Invalid timestamp"
+
+    now = int(time.time())
+
+    # Reject old/replayed requests older than 5 minutes
+    if abs(now - timestamp_int) > 300:
+        return False, "Request expired"
+
+    data = request.get_json(silent=True) or {}
+    body_str = json.dumps(data, separators=(",", ":"))
+    msg = f"{timestamp}:{body_str}".encode("utf-8")
+
+    expected = hmac.new(
+        PERGOCAD_API_SECRET.encode("utf-8"),
+        msg,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, signature):
+        return False, "Invalid request signature"
+
+    return True, "OK"
+    
 # ============================================================
 # ACTIVATION ENDPOINT
 # ============================================================
 
 @app.route('/activate', methods=['POST'])
 def activate():
-    # Verify secret
-    secret = request.headers.get('X-PergoCAD-Secret')
-    if secret != PERGOCAD_API_SECRET:
-        return jsonify({"ok": False, "message": "Unauthorized"}), 401
+    ok_sig, sig_message = verify_hmac_request()
+    if not ok_sig:
+        return jsonify({"ok": False, "message": sig_message}), 401
+
+    data = request.get_json(silent=True) or {}
     
-    # Get request data
-    data = request.json
     key = data.get('key', '').strip()
     company = data.get('company', '').strip()
     pc_id = data.get('pc_id', '').strip()
