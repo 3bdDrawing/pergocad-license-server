@@ -701,8 +701,7 @@ function renderDashboard(data) {
       <td><b>${escapeHtml(l.key)}</b><br><span class="small">${escapeHtml(l.type)}</span></td>
       <td class="${l.active ? 'active' : 'inactive'}">${l.active ? 'ACTIVE' : 'INACTIVE'}</td>
       <td>${escapeHtml(l.sold_to)}<br><span class="small">Sold by: ${escapeHtml(l.sold_by)}<br>Country: ${escapeHtml(l.expected_country || '')}</span></td>
-      <td>${escapeHtml(l.notes || '').replace(/
-/g, '<br>')}</td>
+      <td>${escapeHtml(l.notes || '').replace(/\n/g, '<br>')}</td>
       <td>${l.devices_used}/${l.max_devices}<br>${devices}</td>
       <td>${escapeHtml(l.expiry || '')}<br><span class="small">demo days: ${escapeHtml(l.demo_days || '')}</span></td>
       <td>${issues}</td>
