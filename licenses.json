@@ -1,7 +1,7 @@
 {
   "VER-DEMO-001": {
     "type": "demo",
-    "active": true,
+    "active": false,
     "max_devices": 1,
     "demo_days": 8,
     "expiry": null,
