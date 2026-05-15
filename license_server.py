@@ -206,8 +206,9 @@ def get_client_ip():
 def get_location_from_ip(ip_address):
     """
     Get country and city from IP address.
-    If ipapi fails, keep the IP and return Unknown location.
+    Tries ipapi.co first, then ipwho.is as fallback.
     """
+
     if not ip_address or ip_address == "Unknown" or is_private_ip(ip_address):
         return {
             "country": "Unknown",
@@ -215,6 +216,7 @@ def get_location_from_ip(ip_address):
             "ip": ip_address or "Unknown"
         }
 
+    # Provider 1: ipapi.co
     try:
         response = requests.get(
             f"https://ipapi.co/{ip_address}/json/",
@@ -224,28 +226,46 @@ def get_location_from_ip(ip_address):
 
         data = response.json()
 
-        # ipapi sometimes returns {"error": true, "reason": "..."}
-        if data.get("error"):
-            return {
-                "country": "Unknown",
-                "city": "Unknown",
-                "ip": ip_address,
-                "geo_error": data.get("reason", "ipapi error")
-            }
+        if not data.get("error"):
+            country = data.get("country_name") or data.get("country")
+            city = data.get("city")
 
-        return {
-            "country": data.get("country_name") or data.get("country") or "Unknown",
-            "city": data.get("city") or "Unknown",
-            "ip": ip_address
-        }
+            if country or city:
+                return {
+                    "country": country or "Unknown",
+                    "city": city or "Unknown",
+                    "ip": ip_address
+                }
 
     except Exception as e:
-        print(f"Geolocation error for {ip_address}: {e}")
-        return {
-            "country": "Unknown",
-            "city": "Unknown",
-            "ip": ip_address
-        }
+        print(f"ipapi geolocation error for {ip_address}: {e}")
+
+    # Provider 2: ipwho.is fallback
+    try:
+        response = requests.get(
+            f"https://ipwho.is/{ip_address}",
+            timeout=8,
+            headers={"User-Agent": "PergoCAD-License-Server/1.0"}
+        )
+
+        data = response.json()
+
+        if data.get("success", False):
+            return {
+                "country": data.get("country") or "Unknown",
+                "city": data.get("city") or "Unknown",
+                "ip": ip_address
+            }
+
+    except Exception as e:
+        print(f"ipwho.is geolocation error for {ip_address}: {e}")
+
+    return {
+        "country": "Unknown",
+        "city": "Unknown",
+        "ip": ip_address
+    }
+
 
 def log_activation(key, company, pc_id, location, success, message=""):
     pc_short = (pc_id[:8] + "...") if pc_id else ""
