@@ -418,6 +418,214 @@ def admin_license_reset_devices():
     return jsonify({"ok": True, "message": "Devices reset", "key": key, "deleted_devices": deleted})
 
 
+
+# ============================================================
+# SIMPLE WEB ADMIN PANEL
+# ============================================================
+
+@app.route("/admin", methods=["GET"])
+def admin_page():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PergoCAD License Admin</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background:#f6f7fb; color:#222; }
+    h1 { margin-bottom: 8px; }
+    .card { background:white; border:1px solid #ddd; border-radius:12px; padding:18px; margin:14px 0; box-shadow:0 2px 8px rgba(0,0,0,.05); }
+    label { display:block; font-weight:bold; margin-top:10px; }
+    input, select { width:100%; padding:9px; box-sizing:border-box; margin-top:4px; border:1px solid #bbb; border-radius:8px; }
+    button { padding:9px 12px; border:0; border-radius:8px; cursor:pointer; margin:4px; background:#2457d6; color:white; font-weight:bold; }
+    button.danger { background:#b00020; }
+    button.warn { background:#d68100; }
+    button.gray { background:#666; }
+    table { border-collapse:collapse; width:100%; background:white; }
+    th, td { border:1px solid #ddd; padding:8px; text-align:left; vertical-align:top; font-size:14px; }
+    th { background:#eee; }
+    .row { display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; }
+    .small { font-size:12px; color:#666; }
+    .active { color:green; font-weight:bold; }
+    .inactive { color:#b00020; font-weight:bold; }
+    pre { white-space:pre-wrap; background:#111; color:#eee; padding:12px; border-radius:8px; max-height:300px; overflow:auto; }
+    @media (max-width:900px) { .row { grid-template-columns: 1fr; } table { font-size:12px; } }
+  </style>
+</head>
+<body>
+  <h1>PergoCAD License Admin</h1>
+  <p class="small">Use this page to add/edit/deactivate/delete licenses and reset devices. Keep your admin token private.</p>
+
+  <div class="card">
+    <label>Admin Password / Token</label>
+    <input id="token" type="password" placeholder="Enter ADMIN_PASSWORD">
+    <button onclick="saveToken()">Save Token in this browser</button>
+    <button class="gray" onclick="loadDashboard()">Refresh Dashboard</button>
+    <span id="status" class="small"></span>
+  </div>
+
+  <div class="card">
+    <h2>Add / Edit License</h2>
+    <div class="row">
+      <div><label>License Key</label><input id="key" placeholder="VER-TEST-0001"></div>
+      <div><label>Type</label><select id="type"><option value="paid">paid</option><option value="demo">demo</option></select></div>
+      <div><label>Active</label><select id="active"><option value="true">true</option><option value="false">false</option></select></div>
+      <div><label>Max Devices</label><input id="max_devices" type="number" value="1"></div>
+    </div>
+    <div class="row">
+      <div><label>Demo Days</label><input id="demo_days" type="number" placeholder="3"></div>
+      <div><label>Expiry</label><input id="expiry" placeholder="2026-12-31 or empty"></div>
+      <div><label>Sold To</label><input id="sold_to" placeholder="Customer company"></div>
+      <div><label>Sold By</label><input id="sold_by" placeholder="Salesman / You"></div>
+    </div>
+    <div class="row">
+      <div><label>Sold Date</label><input id="sold_date" placeholder="2026-05-15"></div>
+      <div><label>Expected Country</label><input id="expected_country" placeholder="Türkiye"></div>
+    </div>
+    <button onclick="saveLicense()">Save License</button>
+    <button class="gray" onclick="clearForm()">Clear Form</button>
+  </div>
+
+  <div class="card">
+    <h2>Licenses</h2>
+    <div id="licenses">Click Refresh Dashboard.</div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Activations</h2>
+    <pre id="logs">Click Refresh Dashboard.</pre>
+  </div>
+
+<script>
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function token() { return document.getElementById('token').value.trim(); }
+function saveToken() { localStorage.setItem('pergocad_admin_token', token()); setStatus('Token saved.'); }
+function loadToken() { document.getElementById('token').value = localStorage.getItem('pergocad_admin_token') || ''; }
+
+async function api(path, method='GET', body=null) {
+  const headers = {'X-Admin-Token': token()};
+  if (body !== null) headers['Content-Type'] = 'application/json';
+  const res = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : null});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+function getFormData() {
+  const demoDaysText = document.getElementById('demo_days').value.trim();
+  return {
+    key: document.getElementById('key').value.trim(),
+    type: document.getElementById('type').value,
+    active: document.getElementById('active').value === 'true',
+    max_devices: parseInt(document.getElementById('max_devices').value || '1'),
+    demo_days: demoDaysText ? parseInt(demoDaysText) : null,
+    expiry: document.getElementById('expiry').value.trim() || null,
+    sold_to: document.getElementById('sold_to').value.trim() || null,
+    sold_by: document.getElementById('sold_by').value.trim() || null,
+    sold_date: document.getElementById('sold_date').value.trim() || null,
+    expected_country: document.getElementById('expected_country').value.trim() || null
+  };
+}
+
+async function saveLicense() {
+  try {
+    const data = await api('/admin/license/upsert', 'POST', getFormData());
+    setStatus(data.message || 'Saved');
+    await loadDashboard();
+  } catch (e) { alert(e.message); }
+}
+
+function clearForm() {
+  for (const id of ['key','demo_days','expiry','sold_to','sold_by','sold_date','expected_country']) document.getElementById(id).value = '';
+  document.getElementById('type').value = 'paid';
+  document.getElementById('active').value = 'true';
+  document.getElementById('max_devices').value = '1';
+}
+
+function editLicense(l) {
+  document.getElementById('key').value = l.key || '';
+  document.getElementById('type').value = l.type || 'paid';
+  document.getElementById('active').value = String(!!l.active);
+  document.getElementById('max_devices').value = l.max_devices || 1;
+  document.getElementById('demo_days').value = l.demo_days || '';
+  document.getElementById('expiry').value = l.expiry || '';
+  document.getElementById('sold_to').value = l.sold_to || '';
+  document.getElementById('sold_by').value = l.sold_by || '';
+  document.getElementById('sold_date').value = l.sold_date || '';
+  document.getElementById('expected_country').value = (l.expected_country || '');
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+async function setActive(key, active) {
+  if (!confirm((active ? 'Activate ' : 'Deactivate ') + key + '?')) return;
+  try {
+    await api('/admin/license/set-active', 'POST', {key, active});
+    await loadDashboard();
+  } catch (e) { alert(e.message); }
+}
+
+async function resetDevices(key) {
+  if (!confirm('Reset all activated devices for ' + key + '?')) return;
+  try {
+    await api('/admin/license/reset-devices', 'POST', {key});
+    await loadDashboard();
+  } catch (e) { alert(e.message); }
+}
+
+async function deleteLicense(key) {
+  if (!confirm('DELETE license ' + key + '? This cannot be undone.')) return;
+  try {
+    await api('/admin/license/delete', 'POST', {key});
+    await loadDashboard();
+  } catch (e) { alert(e.message); }
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+}
+
+function renderDashboard(data) {
+  let html = '<table><thead><tr><th>Key</th><th>Status</th><th>Customer</th><th>Devices</th><th>Expiry</th><th>Issues</th><th>Actions</th></tr></thead><tbody>';
+  for (const l of data.licenses || []) {
+    const issues = (l.issues || []).map(escapeHtml).join('<br>');
+    const devices = (l.devices || []).map(d => `${escapeHtml(d.company_name)}<br>${escapeHtml(d.country)} / ${escapeHtml(d.city)}<br>${escapeHtml(d.ip_address)}<br>${escapeHtml(d.pc_id)}<br>checks: ${d.check_count}`).join('<hr>');
+    html += `<tr>
+      <td><b>${escapeHtml(l.key)}</b><br><span class="small">${escapeHtml(l.type)}</span></td>
+      <td class="${l.active ? 'active' : 'inactive'}">${l.active ? 'ACTIVE' : 'INACTIVE'}</td>
+      <td>${escapeHtml(l.sold_to)}<br><span class="small">Sold by: ${escapeHtml(l.sold_by)}<br>Country: ${escapeHtml(l.expected_country || '')}</span></td>
+      <td>${l.devices_used}/${l.max_devices}<br>${devices}</td>
+      <td>${escapeHtml(l.expiry || '')}<br><span class="small">demo days: ${escapeHtml(l.demo_days || '')}</span></td>
+      <td>${issues}</td>
+      <td>
+        <button onclick='editLicense(${JSON.stringify(l).replace(/'/g, "&#39;")})'>Edit</button>
+        <button class="${l.active ? 'warn' : ''}" onclick="setActive('${escapeHtml(l.key)}', ${!l.active})">${l.active ? 'Deactivate' : 'Activate'}</button>
+        <button class="gray" onclick="resetDevices('${escapeHtml(l.key)}')">Reset Devices</button>
+        <button class="danger" onclick="deleteLicense('${escapeHtml(l.key)}')">Delete</button>
+      </td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  document.getElementById('licenses').innerHTML = html;
+  document.getElementById('logs').textContent = JSON.stringify(data.recent_activations || [], null, 2);
+}
+
+async function loadDashboard() {
+  try {
+    setStatus('Loading...');
+    const data = await api('/admin/dashboard');
+    renderDashboard(data);
+    setStatus('Loaded. Total licenses: ' + data.total_licenses);
+  } catch (e) { alert(e.message); setStatus('Error: ' + e.message); }
+}
+
+loadToken();
+</script>
+</body>
+</html>
+    """
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "message": "License server running"})
