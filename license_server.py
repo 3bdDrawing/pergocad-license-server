@@ -692,8 +692,28 @@ async function deleteLicense(key) {
   } catch (e) { alert(e.message); }
 }
 
-function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+function formatDateTime(value) {
+  if (!value) return '';
+
+  try {
+    const date = new Date(value);
+
+    if (isNaN(date.getTime())) {
+      return String(value);
+    }
+
+    return date.toLocaleString('en-GB', {
+      timeZone: 'Europe/Istanbul',
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    }) + ' GMT+3';
+  } catch (e) {
+    return String(value);
+  }
 }
 
 function renderDashboard(data) {
@@ -706,8 +726,8 @@ function renderDashboard(data) {
       Location: ${escapeHtml(d.country)} / ${escapeHtml(d.city)}<br>
       IP: ${escapeHtml(d.ip_address)}<br>
       PC ID: ${escapeHtml(d.pc_id)}<br>
-      Activated: ${escapeHtml(d.activated_at)}<br>
-      Last seen: ${escapeHtml(d.last_seen)}<br>
+      Activated: ${escapeHtml(formatDateTime(d.activated_at))}<br>
+      Last seen: ${escapeHtml(formatDateTime(d.last_seen))}<br>
       Checks: ${escapeHtml(d.check_count)}
     `).join('<hr>');
     html += `<tr>
