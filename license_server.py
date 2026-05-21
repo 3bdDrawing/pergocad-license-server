@@ -700,7 +700,16 @@ function renderDashboard(data) {
   let html = '<table><thead><tr><th>Key</th><th>Status</th><th>Customer</th><th>Devices</th><th>Expiry</th><th>Issues</th><th>Actions</th></tr></thead><tbody>';
   for (const l of data.licenses || []) {
     const issues = (l.issues || []).map(escapeHtml).join('<br>');
-    const devices = (l.devices || []).map(d => `${escapeHtml(d.company_name)}<br>${escapeHtml(d.country)} / ${escapeHtml(d.city)}<br>${escapeHtml(d.ip_address)}<br>${escapeHtml(d.pc_id)}<br>checks: ${d.check_count}`).join('<hr>');
+    const devices = (l.devices || []).map((d, index) => `
+      <b>Device ${index + 1}</b><br>
+      Company: ${escapeHtml(d.company_name)}<br>
+      Location: ${escapeHtml(d.country)} / ${escapeHtml(d.city)}<br>
+      IP: ${escapeHtml(d.ip_address)}<br>
+      PC ID: ${escapeHtml(d.pc_id)}<br>
+      Activated: ${escapeHtml(d.activated_at)}<br>
+      Last seen: ${escapeHtml(d.last_seen)}<br>
+      Checks: ${escapeHtml(d.check_count)}
+    `).join('<hr>');
     html += `<tr>
       <td><b>${escapeHtml(l.key)}</b><br><span class="small">${escapeHtml(l.type)}</span></td>
       <td class="${l.active ? 'active' : 'inactive'}">${l.active ? 'ACTIVE' : 'INACTIVE'}</td>
