@@ -716,6 +716,42 @@ function formatDateTime(value) {
   }
 }
 
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>'"]/g, function(c) {
+    return {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      "'": '&#39;',
+      '"': '&quot;'
+    }[c];
+  });
+}
+
+function formatDateTime(value) {
+  if (!value) return '';
+
+  try {
+    const date = new Date(value);
+
+    if (isNaN(date.getTime())) {
+      return String(value);
+    }
+
+    return date.toLocaleString('en-GB', {
+      timeZone: 'Europe/Istanbul',
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    }) + ' GMT+3';
+  } catch (e) {
+    return String(value);
+  }
+}
+
 function renderDashboard(data) {
   let html = '<table><thead><tr><th>Key</th><th>Status</th><th>Customer</th><th>Devices</th><th>Expiry</th><th>Issues</th><th>Actions</th></tr></thead><tbody>';
   for (const l of data.licenses || []) {
