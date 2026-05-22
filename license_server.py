@@ -76,6 +76,16 @@ def init_db():
                     message TEXT
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_devices (
+                    id BIGSERIAL PRIMARY KEY,
+                    license_key TEXT NOT NULL REFERENCES licenses(license_key) ON DELETE CASCADE,
+                    pc_id TEXT NOT NULL,
+                    blocked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    reason TEXT,
+                    UNIQUE (license_key, pc_id)
+                );
+            """)
             conn.commit()
 
 
@@ -348,6 +358,26 @@ def activate():
                 log_activation(key, company, pc_id, location, False, "Invalid license key")
                 return jsonify({"ok": False, "message": "Invalid license key"})
             license_data = license_row_to_dict(lic_row)
+            # Block this exact PC from using this exact license key.
+            cur.execute(
+                "SELECT id FROM blocked_devices WHERE license_key=%s AND pc_id=%s",
+                (key, pc_id)
+            )
+            blocked = cur.fetchone()
+
+            if blocked:
+                log_activation(
+                    key,
+                    company,
+                    pc_id,
+                    location,
+                    False,
+                    "This device is blocked for this license"
+                )
+                return jsonify({
+                    "ok": False,
+                    "message": "This device has been deactivated for this license. Contact support."
+                }), 403
             if not lic_row["active"]:
                 log_activation(key, company, pc_id, location, False, "License deactivated")
                 return jsonify({"ok": False, "message": "This license has been deactivated"})
@@ -407,11 +437,21 @@ def admin_dashboard():
                 key = row["license_key"]
                 cur.execute("SELECT * FROM devices WHERE license_key=%s ORDER BY activated_at ASC", (key,))
                 devices = cur.fetchall()
+                cur.execute(
+                    "SELECT * FROM blocked_devices WHERE license_key=%s ORDER BY blocked_at DESC",
+                    (key,)
+                )
+                blocked_devices = cur.fetchall()
                 device_list = [{
                     "pc_id": d["pc_id"], "company_name": d["company_name"],
                     "activated_at": d["activated_at"].isoformat(), "last_seen": d["last_seen"].isoformat(),
                     "ip_address": d["ip_address"], "country": d["country"], "city": d["city"], "check_count": d["check_count"]
                 } for d in devices]
+                blocked_device_list = [{
+                    "pc_id": b["pc_id"],
+                    "blocked_at": b["blocked_at"].isoformat(),
+                    "reason": b["reason"]
+                } for b in blocked_devices]
                 countries = sorted(list(set([d["country"] or "Unknown" for d in devices])))
                 companies = sorted(list(set([d["company_name"] or "Unknown" for d in devices])))
                 issues = []
@@ -435,7 +475,11 @@ def admin_dashboard():
                     "expiry": row["expiry"].strftime(DATE_FMT) if row["expiry"] else None,
                     "demo_days": row["demo_days"], "notes": row.get("notes"),
                     "devices_used": len(devices), "max_devices": row["max_devices"],
-                    "countries": countries, "companies_entered": companies, "issues": issues, "devices": device_list
+                    "countries": countries,
+                    "companies_entered": companies,
+                    "issues": issues,
+                    "devices": device_list,
+                    "blocked_devices": blocked_device_list
                 })
             cur.execute("SELECT * FROM activation_logs ORDER BY timestamp DESC LIMIT 100")
             logs = cur.fetchall()
@@ -522,7 +566,48 @@ def admin_license_reset_devices():
             conn.commit()
     return jsonify({"ok": True, "message": "Devices reset", "key": key, "deleted_devices": deleted})
 
+@app.route("/admin/license/block-device", methods=["POST"])
+def admin_license_block_device():
+    if not verify_admin():
+        return jsonify({"ok": False, "message": "Unauthorized"}), 401
 
+    data = request.get_json(silent=True) or {}
+
+    key = (data.get("key") or "").strip()
+    pc_id = (data.get("pc_id") or "").strip()
+    reason = (data.get("reason") or "Blocked from admin panel").strip()
+
+    if not key or not pc_id:
+        return jsonify({
+            "ok": False,
+            "message": "License key and PC ID are required"
+        }), 400
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            # Add to blocked list.
+            cur.execute("""
+                INSERT INTO blocked_devices (license_key, pc_id, reason)
+                VALUES (%s,%s,%s)
+                ON CONFLICT (license_key, pc_id) DO UPDATE SET
+                    blocked_at=NOW(),
+                    reason=EXCLUDED.reason
+            """, (key, pc_id, reason))
+
+            # Remove from active devices so the used device count decreases.
+            cur.execute(
+                "DELETE FROM devices WHERE license_key=%s AND pc_id=%s",
+                (key, pc_id)
+            )
+
+            conn.commit()
+
+    return jsonify({
+        "ok": True,
+        "message": "Device blocked for this license",
+        "key": key,
+        "pc_id": pc_id
+    })
 
 # ============================================================
 # SIMPLE WEB ADMIN PANEL
@@ -684,6 +769,26 @@ async function resetDevices(key) {
   } catch (e) { alert(e.message); }
 }
 
+async function blockDevice(encodedKey, encodedPcId) {
+  const key = decodeURIComponent(encodedKey);
+  const pc_id = decodeURIComponent(encodedPcId);
+
+  if (!confirm('Block this device from using license ' + key + '?')) return;
+
+  try {
+    const data = await api('/admin/license/block-device', 'POST', {
+      key: key,
+      pc_id: pc_id,
+      reason: 'Blocked from admin panel'
+    });
+
+    setStatus(data.message || 'Device blocked');
+    await loadDashboard();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
 async function deleteLicense(key) {
   if (!confirm('DELETE license ' + key + '? This cannot be undone.')) return;
   try {
@@ -764,12 +869,27 @@ function renderDashboard(data) {
       PC ID: ${escapeHtml(d.pc_id)}<br>
       Activated: ${escapeHtml(formatDateTime(d.activated_at))}<br>
       Last seen: ${escapeHtml(formatDateTime(d.last_seen))}<br>
-      Checks: ${escapeHtml(d.check_count)}
+      Checks: ${escapeHtml(d.check_count)}<br>
+      <button class="danger" onclick="blockDevice('${encodeURIComponent(l.key)}', '${encodeURIComponent(d.pc_id)}')">
+        Block Device
+      </button>
     `).join('<hr>');
+    const blockedDevices = (l.blocked_devices || []).map((d, index) => `
+      <b>Blocked Device ${index + 1}</b><br>
+      PC ID: ${escapeHtml(d.pc_id)}<br>
+      Blocked: ${escapeHtml(formatDateTime(d.blocked_at))}<br>
+      Reason: ${escapeHtml(d.reason)}
+    `).join('<hr>');
+    
+    const deviceCell = `
+      <b>Active devices:</b> ${l.devices_used}/${l.max_devices}<br>
+      ${devices || '<span class="small">No active devices</span>'}
+      ${blockedDevices ? '<hr><b>Blocked devices:</b><br>' + blockedDevices : ''}
+    `;
     html += `<tr>
       <td><b>${escapeHtml(l.key)}</b><br><span class="small">${escapeHtml(l.type)}</span></td>
       <td class="${l.active ? 'active' : 'inactive'}">${l.active ? 'ACTIVE' : 'INACTIVE'}</td>
-      <td>${escapeHtml(l.sold_to)}<br><span class="small">Sold by: ${escapeHtml(l.sold_by)}<br>Country: ${escapeHtml(l.expected_country || '')}<br><b>Notes:</b><br>${escapeHtml(l.notes || '')}</span></td>      <td>${l.devices_used}/${l.max_devices}<br>${devices}</td>
+      <td>${escapeHtml(l.sold_to)}<br><span class="small">Sold by: ${escapeHtml(l.sold_by)}<br>Country: ${escapeHtml(l.expected_country || '')}<br><b>Notes:</b><br>${escapeHtml(l.notes || '')}</span></td>      <td>${deviceCell}</td>
       <td>${escapeHtml(l.expiry || '')}<br><span class="small">demo days: ${escapeHtml(l.demo_days || '')}</span></td>
       <td>${issues}</td>
       <td>
